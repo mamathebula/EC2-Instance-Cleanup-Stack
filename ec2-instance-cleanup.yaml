@@ -1,0 +1,172 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'EC2 Instance Cleanup - Terminates untagged instances running for more than 1 hour'
+
+Parameters:
+  ExcludeString:
+    Type: String
+    Default: 'do-not-delete'
+    Description: Instances with this string in their Name tag will be protected
+
+  NotificationEmail:
+    Type: String
+    Description: Email address for termination notifications
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+
+  ScheduleExpression:
+    Type: String
+    Default: 'rate(30 minutes)'
+    Description: How often to check for instances to terminate
+
+Resources:
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-notifications'
+      Subscription:
+        - Endpoint: !Ref NotificationEmail
+          Protocol: email
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-${AWS::Region}-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: EC2CleanupPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:TerminateInstances
+                  - ec2:DescribeTags
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref NotificationTopic
+
+  CleanupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-function'
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          EXCLUDE_STRING: !Ref ExcludeString
+          SNS_TOPIC_ARN: !Ref NotificationTopic
+      Code:
+        ZipFile: |
+          import boto3
+          import datetime
+          import os
+
+          ec2 = boto3.client('ec2')
+          sns = boto3.client('sns')
+
+          EXCLUDE_STRING = os.environ.get('EXCLUDE_STRING', 'do-not-delete')
+          SNS_TOPIC_ARN = os.environ.get('SNS_TOPIC_ARN')
+
+          def lambda_handler(event, context):
+              terminated = []
+              protected = []
+              
+              response = ec2.describe_instances(
+                  Filters=[{'Name': 'instance-state-name', 'Values': ['pending', 'running', 'stopping', 'stopped']}]
+              )
+              
+              now = datetime.datetime.utcnow()
+              
+              for reservation in response['Reservations']:
+                  for instance in reservation['Instances']:
+                      instance_id = instance['InstanceId']
+                      instance_name = 'N/A'
+                      is_protected = False
+                      
+                      # Check tags
+                      for tag in instance.get('Tags', []):
+                          if tag['Key'] == 'Name':
+                              instance_name = tag['Value']
+                          if EXCLUDE_STRING.lower() in tag.get('Value', '').lower():
+                              is_protected = True
+                      
+                      if is_protected:
+                          protected.append(f"{instance_id} ({instance_name})")
+                          continue
+                      
+                      # Check if running for more than 1 hour
+                      launch_time = instance['LaunchTime'].replace(tzinfo=None)
+                      running_time = now - launch_time
+                      
+                      if running_time >= datetime.timedelta(hours=1):
+                          try:
+                              ec2.terminate_instances(InstanceIds=[instance_id])
+                              terminated.append(f"{instance_id} ({instance_name}) - running for {running_time}")
+                              print(f"Terminated: {instance_id} ({instance_name}) - {running_time}")
+                          except Exception as e:
+                              print(f"Failed to terminate {instance_id}: {e}")
+                      else:
+                          print(f"Skipping {instance_id} ({instance_name}) - only running for {running_time}")
+              
+              # Send notification if anything was terminated
+              if terminated:
+                  region = os.environ.get('AWS_REGION', 'unknown')
+                  message = f"EC2 Instance Cleanup Report\n"
+                  message += f"Region: {region}\n"
+                  message += f"Time: {now.strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
+                  message += f"TERMINATED ({len(terminated)}):\n"
+                  for t in terminated:
+                      message += f"  - {t}\n"
+                  message += f"\nPROTECTED ({len(protected)}):\n"
+                  for p in protected:
+                      message += f"  - {p}\n"
+                  
+                  sns.publish(
+                      TopicArn=SNS_TOPIC_ARN,
+                      Message=message,
+                      Subject=f"[{region}] EC2 Cleanup: {len(terminated)} instances terminated"
+                  )
+              
+              return {
+                  'terminated': len(terminated),
+                  'protected': len(protected)
+              }
+
+  ScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-schedule'
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt CleanupFunction.Arn
+          Id: EC2CleanupTarget
+
+  LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CleanupFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ScheduleRule.Arn
+
+Outputs:
+  FunctionArn:
+    Description: Cleanup Lambda ARN
+    Value: !GetAtt CleanupFunction.Arn
+  TopicArn:
+    Description: SNS Topic ARN
+    Value: !Ref NotificationTopic
